@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+from pathlib import Path
+from typing import List, Optional
+import json
+
+from modules.downloader import YouTubeDownloader
+from modules.transcriber import VideoTranscriber
+from modules.mimo_transcriber import transcribe_with_engine
+from modules.analyzer import ViralMomentAnalyzer
+from modules.video_processor import VideoProcessor
+from modules.subtitle_generator import SubtitleGenerator
+from utils.helpers import (
+    check_dependencies, 
+    select_moments, 
+    estimate_processing_time,
+    create_summary_report,
+    format_time,
+    ProgressBar
+)
+from config import VIDEO_QUALITY, DEFAULT_NUM_CLIPS, SUBTITLE_TEMPLATES
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="YouTube Video Viral Moment Extractor - Automatically extract viral moments with animated subtitles",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py --url "https://youtube.com/watch?v=..." 
+  python main.py --url "https://youtube.com/watch?v=..." --quality 1080p --clips 3
+  python main.py --url "https://youtube.com/watch?v=..." --no-subtitles
+  python main.py --file "path/to/video.mp4" --clips 5
+        """
+    )
+    
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--url', type=str, help='YouTube video URL')
+    input_group.add_argument('--file', type=str, help='Local video file path')
+    
+    parser.add_argument('--quality', type=str, default=VIDEO_QUALITY, 
+                       choices=['360p', '480p', '720p', '1080p'],
+                       help='Video download quality (default: %(default)s)')
+    parser.add_argument('--clips', type=int, default=DEFAULT_NUM_CLIPS,
+                       help='Maximum number of clips to generate (default: %(default)s)')
+    parser.add_argument('--no-subtitles', action='store_true',
+                       help='Skip adding subtitles to clips')
+    parser.add_argument('--force-transcribe', action='store_true',
+                       help='Force re-transcription even if transcript exists')
+    parser.add_argument('--output-dir', type=str,
+                       help='Custom output directory for clips')
+    parser.add_argument('--format', type=str, default='vertical',
+                       choices=['vertical', 'horizontal'],
+                       help='Output format: vertical (9:16) for social media or horizontal (16:9) (default: vertical)')
+    parser.add_argument('--layout', type=str, default='center-crop',
+                       choices=['center-crop', 'split-stack', 'blur-background'],
+                       help='Vertical layout: blur-background fits over blurred video; center-crop keeps the middle of the frame, '
+                            'split-stack stacks two side-by-side speakers vertically '
+                            '(for two-person podcast framing) (default: center-crop)')
+    parser.add_argument('--subtitle-style', type=str, default='Classic',
+                       choices=list(SUBTITLE_TEMPLATES.keys()),
+                       help='Subtitle style template (default: Classic)')
+    parser.add_argument('--render-engine', choices=['auto', 'nvenc', 'cpu'], default='auto',
+                        help='Auto (recommended), NVIDIA NVENC, or CPU/libx264')
+    parser.add_argument('--text-animation', choices=['none', 'pop', 'bounce'], default=None,
+                       help='Subtitle animation (TikTok Style defaults to pop)')
+    parser.add_argument('--active-word', action='store_true', help='Animate only the spoken word')
+    parser.add_argument('--min-score', type=float, default=7.0,
+                       help='Minimum virality score (0-10) to extract clips (default: %(default)s)')
+    parser.add_argument('--provider', type=str, default='ollama',
+                       choices=['ollama', 'openai', 'anthropic'],
+                       help='AI provider for viral detection (default: %(default)s)')
+    parser.add_argument('--transcription-engine', choices=['whisper', 'mimo'], default='whisper',
+                       help='Speech recognition engine (default: Whisper Local)')
+    parser.add_argument('--whisper-model', type=str, default=None,
+                       help='Whisper model override, e.g. base, small, medium, large-v3, '
+                            'large-v3-turbo (default: config WHISPER_MODEL)')
+    parser.add_argument('--language', type=str, default=None,
+                       help='Audio language hint for transcription, e.g. fr, en '
+                            '(default: auto-detect)')
+    
+    args = parser.parse_args()
+    
+    print("\n🎬 YouTube Video Viral Moment Extractor")
+    print("=" * 50)
+    
+    if not check_dependencies(provider=args.provider):
+        print("\n❌ Please install missing dependencies and try again.")
+        sys.exit(1)
+    
+    try:
+        if args.url:
+            print(f"\n📥 Downloading video from YouTube...")
+            downloader = YouTubeDownloader()
+            video_metadata = downloader.download(args.url, args.quality)
+            video_path = video_metadata['filepath']
+            print(f"✅ Downloaded: {video_metadata['title']}")
+        else:
+            video_path = args.file
+            if not Path(video_path).exists():
+                raise FileNotFoundError(f"Video file not found: {video_path}")
+            
+            processor = VideoProcessor(render_engine=args.render_engine)
+            video_info = processor.get_video_info(video_path)
+            video_metadata = {
+                'title': Path(video_path).stem,
+                'duration': video_info['duration'],
+                'filepath': video_path,
+                'url': 'Local file'
+            }
+            print(f"✅ Using local file: {Path(video_path).name}")
+        
+        print(f"\n🎧 Transcribing audio ({args.transcription_engine})...")
+        print(f"Estimated time: {format_time(video_metadata['duration'] * 0.3)}")
+        
+        if args.whisper_model:
+            transcriber = VideoTranscriber(model_name=args.whisper_model)
+        else:
+            transcriber = VideoTranscriber()
+        transcript = transcribe_with_engine(transcriber, video_path, engine=args.transcription_engine,
+                                            force=args.force_transcribe, language=args.language, notice=print)
+        print(f"✅ Transcription complete: {len(transcript['segments'])} segments")
+        
+        print(f"\n🤖 Analyzing transcript for viral moments (provider: {args.provider})...")
+        analyzer = ViralMomentAnalyzer(provider=args.provider)
+        viral_moments = analyzer.analyze_transcript(transcript)
+        
+        if not viral_moments:
+            print("\n❌ No viral moments found with sufficient score.")
+            print("Try a different video or adjust the viral score threshold.")
+            sys.exit(0)
+        
+        print(f"✅ Found {len(viral_moments)} potential viral moments!")
+        
+        # Filter by minimum score
+        high_scoring_moments = [m for m in viral_moments if m['score'] >= args.min_score]
+        
+        if not high_scoring_moments:
+            if analyzer.profile == 'gaming':
+                print('No gaming highlights met the minimum score; no filler clips selected.')
+                return
+            print(f"\n⚠️ No moments reached the minimum score of {args.min_score}/10.")
+            print(f"Showing top {min(3, len(viral_moments))} moments instead:")
+            high_scoring_moments = viral_moments[:min(3, len(viral_moments))]
+        else:
+            print(f"✅ {len(high_scoring_moments)} moments with score ≥ {args.min_score}/10")
+        
+        selected_moments = select_moments(high_scoring_moments, args.clips)
+        
+        if not selected_moments:
+            print("\n❌ No moments selected.")
+            sys.exit(0)
+        
+        print(f"\n✂️  Extracting {len(selected_moments)} clips...")
+        processor = VideoProcessor(render_engine=args.render_engine)
+        
+        refined_moments = analyzer.refine_moments(selected_moments, transcript)
+        validated_moments = processor.validate_timestamps(video_path, refined_moments)
+        
+        progress = ProgressBar(len(validated_moments), "Extracting clips")
+        clip_paths = []
+        
+        for i, moment in enumerate(validated_moments):
+            try:
+                output_name = f"viral_clip_{i+1}_score_{moment['score']:.1f}"
+                clip_path = processor.extract_clip(
+                    video_path,
+                    moment['start'],
+                    moment['end'],
+                    output_name,
+                    vertical_format=(args.format == 'vertical'),
+                    layout=args.layout
+                )
+                clip_paths.append(clip_path)
+                
+                import json
+                metadata_path = Path(clip_path).with_suffix('.json')
+                with open(metadata_path, 'w') as f:
+                    json.dump({
+                        'original_video': str(video_path),
+                        'start_time': moment['start'],
+                        'end_time': moment['end'],
+                        'duration': moment['duration'],
+                        'score': moment['score'],
+                        'reason': moment['reason'],
+                        'original_start': moment.get('original_start', moment['start']),
+                        'original_end': moment.get('original_end', moment['end'])
+                    }, f, indent=2)
+                
+                progress.update()
+            except Exception as e:
+                print(f"\n⚠️  Failed to extract clip {i+1}: {e}")
+        
+        progress.finish()
+        print(f"✅ Extracted {len(clip_paths)} clips successfully!")
+        
+        if not args.no_subtitles and clip_paths:
+            print(f"\n🎨 Adding animated subtitles to clips...")
+            generator = SubtitleGenerator(render_engine=args.render_engine)
+            
+            if args.output_dir:
+                generator.output_dir = Path(args.output_dir)
+                generator.output_dir.mkdir(exist_ok=True)
+            
+            progress = ProgressBar(len(clip_paths), "Adding subtitles")
+            final_clips = []
+            
+            for clip_path in clip_paths:
+                try:
+                    metadata_path = Path(clip_path).with_suffix('.json')
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    
+                    output_name = Path(clip_path).stem
+                    subtitled_path = generator.add_subtitles(
+                        clip_path,
+                        transcript,
+                        metadata.get('original_start', metadata['start_time']),
+                        metadata.get('original_end', metadata['end_time']),
+                        output_name,
+                        vertical_format=(args.format == 'vertical'),
+                        clip_start_time=metadata['start_time'],
+                        style_template=args.subtitle_style,
+                        # Captions sit on the seam between the two stacked
+                        # speaker panels instead of over the bottom face
+                        position_override=0.5 if args.layout == 'split-stack' else None,
+                        subtitle_settings={**({'animation': args.text_animation} if args.text_animation else {}),
+                                           'active_word': args.active_word}
+                    )
+                    final_clips.append(subtitled_path)
+                    progress.update()
+                except Exception as e:
+                    print(f"\n⚠️  Failed to add subtitles: {e}")
+                    final_clips.append(clip_path)
+            
+            progress.finish()
+            print(f"✅ Added subtitles to {len(final_clips)} clips!")
+        else:
+            final_clips = clip_paths
+        
+        summary_path = create_summary_report(video_metadata, validated_moments, final_clips)
+        
+        print("\n🎉 Processing complete!")
+        print(f"📁 Output directory: {Path(final_clips[0]).parent if final_clips else 'outputs/'}")
+        print(f"📊 Generated {len(final_clips)} viral clips")
+        
+        if final_clips:
+            print("\n📹 Generated clips:")
+            for i, clip in enumerate(final_clips):
+                print(f"   {i+1}. {Path(clip).name}")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Process interrupted by user.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
